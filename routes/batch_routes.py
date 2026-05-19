@@ -7,12 +7,14 @@ from flask import Blueprint, request, jsonify
 from werkzeug.utils import secure_filename
 import os
 import zipfile
+import shutil
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from models import db, Document, BatchProcess, Template, ExtractionRecord
 from services.extraction_engine import AIExtractionEngine
 from utils.document_parser import DocumentParser
 from datetime import datetime
+from pathlib import Path
 
 bp = Blueprint('batch', __name__, url_prefix='/api/batch')
 
@@ -20,6 +22,54 @@ ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg', 'docx', 'xlsx', 'zip'}
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def _extract_zip_to_documents(zip_path: str, template: Template, uploaded_files: list[int], errors: list[str]):
+    supported_exts = {e for e in ALLOWED_EXTENSIONS if e != 'zip'}
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        infos = [i for i in zf.infolist() if not i.is_dir()]
+        if len(infos) > 200:
+            errors.append('ZIP内文件过多(>200)，已拒绝处理')
+            return
+
+        total_size = sum([i.file_size for i in infos])
+        if total_size > 200 * 1024 * 1024:
+            errors.append('ZIP解压后总大小超过200MB，已拒绝处理')
+            return
+
+        for info in infos:
+            inner_name = Path(info.filename).name
+            if not inner_name:
+                continue
+            inner_ext = inner_name.rsplit('.', 1)[1].lower() if '.' in inner_name else ''
+            if inner_ext not in supported_exts:
+                continue
+
+            try:
+                safe_inner_name = secure_filename(inner_name)
+                unique_filename = f"{uuid.uuid4().hex}_{safe_inner_name}"
+                file_path = os.path.join('uploads', unique_filename)
+
+                with zf.open(info, 'r') as src, open(file_path, 'wb') as dst:
+                    shutil.copyfileobj(src, dst)
+
+                file_size = os.path.getsize(file_path)
+
+                document = Document(
+                    filename=unique_filename,
+                    original_filename=inner_name,
+                    file_path=file_path,
+                    file_type=inner_ext,
+                    file_size=file_size,
+                    status='uploaded',
+                    document_type=template.document_type
+                )
+
+                db.session.add(document)
+                db.session.commit()
+
+                uploaded_files.append(document.id)
+            except Exception as e:
+                errors.append(f"{inner_name}: {str(e)}")
 
 @bp.route('/upload', methods=['POST'])
 def upload_batch():
@@ -67,28 +117,42 @@ def upload_batch():
             
             try:
                 filename = secure_filename(file.filename)
-                unique_filename = f"{uuid.uuid4().hex}_{filename}"
-                file_path = os.path.join('uploads', unique_filename)
-                
-                file.save(file_path)
-                
-                file_size = os.path.getsize(file_path)
-                file_type = filename.rsplit('.', 1)[1].lower()
-                
-                document = Document(
-                    filename=unique_filename,
-                    original_filename=filename,
-                    file_path=file_path,
-                    file_type=file_type,
-                    file_size=file_size,
-                    status='uploaded',
-                    document_type=template.document_type
-                )
-                
-                db.session.add(document)
-                db.session.commit()
-                
-                uploaded_files.append(document.id)
+                ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
+                if ext == 'zip':
+                    zip_filename = f"{uuid.uuid4().hex}.zip"
+                    zip_path = os.path.join('uploads', zip_filename)
+                    file.save(zip_path)
+                    try:
+                        _extract_zip_to_documents(zip_path, template, uploaded_files, errors)
+                    finally:
+                        try:
+                            if os.path.exists(zip_path):
+                                os.remove(zip_path)
+                        except Exception:
+                            pass
+                else:
+                    unique_filename = f"{uuid.uuid4().hex}_{filename}"
+                    file_path = os.path.join('uploads', unique_filename)
+                    
+                    file.save(file_path)
+                    
+                    file_size = os.path.getsize(file_path)
+                    file_type = ext
+                    
+                    document = Document(
+                        filename=unique_filename,
+                        original_filename=filename,
+                        file_path=file_path,
+                        file_type=file_type,
+                        file_size=file_size,
+                        status='uploaded',
+                        document_type=template.document_type
+                    )
+                    
+                    db.session.add(document)
+                    db.session.commit()
+                    
+                    uploaded_files.append(document.id)
             
             except Exception as e:
                 errors.append(f"{file.filename}: {str(e)}")
@@ -98,6 +162,7 @@ def upload_batch():
         batch.successful_files = 0
         batch.failed_files = len(errors)
         batch.status = 'pending'
+        batch.results = {'document_ids': uploaded_files}
         db.session.commit()
         
         return jsonify({
@@ -150,40 +215,7 @@ def upload_batch_zip():
         uploaded_files = []
         errors = []
         
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            for filename in zip_ref.namelist():
-                if not allowed_file(filename):
-                    continue
-                
-                try:
-                    unique_filename = f"{uuid.uuid4().hex}_{secure_filename(filename)}"
-                    extract_path = os.path.join('uploads', unique_filename)
-                    
-                    zip_ref.extract(filename, extract_path)
-                    
-                    actual_file_path = os.path.join(os.path.dirname(extract_path), filename)
-                    
-                    if os.path.exists(actual_file_path):
-                        file_size = os.path.getsize(actual_file_path)
-                        file_type = filename.rsplit('.', 1)[1].lower()
-                        
-                        document = Document(
-                            filename=unique_filename,
-                            original_filename=filename,
-                            file_path=actual_file_path,
-                            file_type=file_type,
-                            file_size=file_size,
-                            status='uploaded',
-                            document_type=template.document_type
-                        )
-                        
-                        db.session.add(document)
-                        db.session.commit()
-                        
-                        uploaded_files.append(document.id)
-                
-                except Exception as e:
-                    errors.append(f"{filename}: {str(e)}")
+        _extract_zip_to_documents(zip_path, template, uploaded_files, errors)
         
         os.remove(zip_path)
         
@@ -192,6 +224,7 @@ def upload_batch_zip():
         batch.successful_files = 0
         batch.failed_files = len(errors)
         batch.status = 'pending'
+        batch.results = {'document_ids': uploaded_files}
         db.session.commit()
         
         return jsonify({
@@ -365,7 +398,10 @@ def get_batch_results(batch_id):
             'error': '批次处理未完成或无结果'
         }), 400
     
-    document_ids = batch.results.get('document_ids', [])
+    document_ids = (batch.results or {}).get('document_ids') or []
+    if not document_ids:
+        rs = (batch.results or {}).get('results') or []
+        document_ids = [r.get('document_id') for r in rs if r.get('document_id')]
     documents = Document.query.filter(Document.id.in_(document_ids)).all()
     
     extractions = ExtractionRecord.query.filter(
@@ -401,7 +437,10 @@ def export_batch_results(batch_id):
     if not batch.results:
         return jsonify({'success': False, 'error': '批次处理未完成'}), 400
     
-    document_ids = batch.results.get('document_ids', [])
+    document_ids = (batch.results or {}).get('document_ids') or []
+    if not document_ids:
+        rs = (batch.results or {}).get('results') or []
+        document_ids = [r.get('document_id') for r in rs if r.get('document_id')]
     extractions = ExtractionRecord.query.filter(
         ExtractionRecord.document_id.in_(document_ids)
     ).all()

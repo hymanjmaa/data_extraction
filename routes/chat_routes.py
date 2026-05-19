@@ -6,12 +6,15 @@ from flask import Blueprint, request, jsonify
 from werkzeug.utils import secure_filename
 import os
 import uuid
+import zipfile
+import shutil
 from models import db, ChatMessage, ChatSession, Template, Document, ExtractionRecord, BatchProcess
 from services.extraction_engine import AIExtractionEngine
 from services.template_generator import TemplateGenerator
 from utils.document_parser import DocumentParser
 from datetime import datetime
 import json
+from pathlib import Path
 
 bp = Blueprint('chat', __name__, url_prefix='/api/chat')
 ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg', 'docx', 'xlsx', 'zip'}
@@ -155,20 +158,13 @@ def _render_template_choices(templates: list[Template]) -> str:
     more = '' if len(templates) <= 10 else f"\n(还有 {len(templates) - 10} 个模板未展示，可继续“列出模板”)"
     return "可选模板：\n" + "\n".join(lines) + more
 
-def _extract_one_file(file_storage, template: Template) -> dict:
-    _ensure_upload_dir()
-
-    filename = secure_filename(file_storage.filename or '')
-    unique_filename = f"{uuid.uuid4().hex}_{filename}"
-    file_path = os.path.join('uploads', unique_filename)
-    file_storage.save(file_path)
-
+def _extract_saved_file(file_path: str, unique_filename: str, original_filename: str, template: Template) -> dict:
     file_size = os.path.getsize(file_path)
-    file_type = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
+    file_type = original_filename.rsplit('.', 1)[1].lower() if '.' in original_filename else ''
 
     document = Document(
         filename=unique_filename,
-        original_filename=filename,
+        original_filename=original_filename,
         file_path=file_path,
         file_type=file_type,
         file_size=file_size,
@@ -184,7 +180,7 @@ def _extract_one_file(file_storage, template: Template) -> dict:
         db.session.commit()
         return {
             'document_id': document.id,
-            'filename': filename,
+            'filename': original_filename,
             'success': False,
             'error': parsed_doc.get('error')
         }
@@ -213,12 +209,73 @@ def _extract_one_file(file_storage, template: Template) -> dict:
 
     return {
         'document_id': document.id,
-        'filename': filename,
+        'filename': original_filename,
         'success': bool(result.get('success')),
         'confidence': result.get('confidence', 0.0),
         'data': extraction.extracted_data,
         'error': extraction.error_message
     }
+
+def _extract_zip_file(zip_path: str, zip_name: str, template: Template) -> list[dict]:
+    supported_exts = {e for e in ALLOWED_EXTENSIONS if e != 'zip'}
+    results: list[dict] = []
+
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            infos = [i for i in zf.infolist() if not i.is_dir()]
+            if len(infos) > 200:
+                return [{'filename': zip_name, 'success': False, 'error': 'ZIP内文件过多(>200)，已拒绝处理'}]
+
+            total_size = sum([i.file_size for i in infos])
+            if total_size > 200 * 1024 * 1024:
+                return [{'filename': zip_name, 'success': False, 'error': 'ZIP解压后总大小超过200MB，已拒绝处理'}]
+
+            for info in infos:
+                inner_name = Path(info.filename).name
+                if not inner_name:
+                    continue
+                inner_ext = inner_name.rsplit('.', 1)[1].lower() if '.' in inner_name else ''
+                if inner_ext not in supported_exts:
+                    continue
+
+                safe_inner_name = secure_filename(inner_name)
+                unique_filename = f"{uuid.uuid4().hex}_{safe_inner_name}"
+                file_path = os.path.join('uploads', unique_filename)
+
+                with zf.open(info, 'r') as src, open(file_path, 'wb') as dst:
+                    shutil.copyfileobj(src, dst)
+
+                results.append(_extract_saved_file(file_path, unique_filename, inner_name, template))
+
+    except Exception as e:
+        return [{'filename': zip_name, 'success': False, 'error': str(e)}]
+
+    if not results:
+        return [{'filename': zip_name, 'success': False, 'error': 'ZIP内未找到可处理的文件'}]
+
+    return results
+
+def _extract_one_file(file_storage, template: Template) -> dict | list[dict]:
+    _ensure_upload_dir()
+
+    filename = secure_filename(file_storage.filename or '')
+    unique_filename = f"{uuid.uuid4().hex}_{filename}"
+    file_path = os.path.join('uploads', unique_filename)
+    file_storage.save(file_path)
+
+    ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
+    if ext == 'zip':
+        try:
+            results = _extract_zip_file(file_path, filename, template)
+        finally:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception:
+                pass
+        return results
+
+    return _extract_saved_file(file_path, unique_filename, filename, template)
 
 @bp.route('/agent/message', methods=['POST'])
 def agent_message():
@@ -495,7 +552,11 @@ def agent_message():
                     else:
                         results = []
                         for f in files:
-                            results.append(_extract_one_file(f, template))
+                            r = _extract_one_file(f, template)
+                            if isinstance(r, list):
+                                results.extend(r)
+                            else:
+                                results.append(r)
                         mode = pending.get('mode', 'single')
                         if mode == 'batch' or len(results) > 1:
                             batch = BatchProcess(
@@ -506,7 +567,10 @@ def agent_message():
                                 successful_files=len([r for r in results if r.get('success')]),
                                 failed_files=len([r for r in results if not r.get('success')]),
                                 template_id=template.id,
-                                results={'results': results},
+                                results={
+                                    'results': results,
+                                    'document_ids': [r.get('document_id') for r in results if r.get('document_id')]
+                                },
                                 completed_at=datetime.utcnow()
                             )
                             db.session.add(batch)
