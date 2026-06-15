@@ -1,14 +1,13 @@
 <template>
   <div class="chatbot">
-    <el-page-header @back="$router.back()" content="即时通讯助手" />
+    <el-page-header @back="$router.back()" content="文档数据提取助手" />
 
     <el-card class="chat-card">
       <template #header>
         <div class="chat-header">
           <el-space>
             <el-select v-model="meta.source" size="small" style="width: 120px">
-              <el-option label="微信" value="wechat" />
-              <el-option label="邮件" value="email" />
+              <el-option label="文档" value="document" />
               <el-option label="其他" value="other" />
             </el-select>
             <el-input v-model="meta.sender" size="small" style="width: 180px" placeholder="发送者(可选)" />
@@ -19,7 +18,7 @@
 
       <div ref="chatBodyRef" class="chat-body">
         <div v-if="chatMessages.length === 0" class="chat-empty">
-          输入一段微信群/邮件内容，我会提取其中的租赁/交易/联系人/时间/金额等信息，并输出结构化结果。
+          上传文档或输入指令，我会进行相应的数据提取操作。输入"帮助"查看可用指令。
         </div>
 
         <div v-for="m in chatMessages" :key="m.localId" class="chat-row" :class="m.role">
@@ -53,6 +52,9 @@
           >
             <el-button size="small">选择附件</el-button>
           </el-upload>
+          <el-button size="small" @click="showChatHistoryDialog">
+            选择聊天历史
+          </el-button>
         </div>
         <div class="chat-compose">
           <el-input
@@ -64,6 +66,14 @@
             @keydown.enter.exact.prevent="send"
           />
           <div class="chat-actions">
+            <el-button
+              :disabled="!speechSupported || sending"
+              :type="isRecording ? 'danger' : 'default'"
+              @click="toggleVoice"
+            >
+              <el-icon><Microphone /></el-icon>
+              {{ isRecording ? '停止' : '语音' }}
+            </el-button>
             <el-button type="primary" @click="send" :loading="sending" :disabled="!inputText.trim() && pendingFiles.length === 0">
               发送
             </el-button>
@@ -71,16 +81,57 @@
         </div>
       </div>
     </el-card>
+
+    <el-dialog v-model="chatHistoryVisible" title="选择聊天历史" width="800px">
+      <el-form :inline="true" class="chat-filter-form">
+        <el-form-item label="时间范围">
+          <el-date-picker
+            v-model="chatTimeRange"
+            type="datetimerange"
+            start-placeholder="开始时间"
+            end-placeholder="结束时间"
+            value-format="YYYY-MM-DDTHH:mm:ss"
+          />
+        </el-form-item>
+        <el-form-item label="群组/联系人">
+          <el-select v-model="chatFilterName" clearable placeholder="选择">
+            <el-option v-for="g in chatGroups" :key="g.chat_name" :label="g.chat_name" :value="g.chat_name" />
+          </el-select>
+        </el-form-item>
+        <el-form-item>
+          <el-button type="primary" @click="fetchWeChatMessages">查询</el-button>
+        </el-form-item>
+      </el-form>
+
+      <el-table
+        :data="wechatMessages"
+        style="width: 100%"
+        v-loading="chatHistoryLoading"
+        @selection-change="handleChatSelectionChange"
+      >
+        <el-table-column type="selection" width="55" />
+        <el-table-column prop="timestamp" label="时间" width="180" />
+        <el-table-column prop="chat_name" label="群组/联系人" width="180" />
+        <el-table-column prop="sender_name" label="发送者" width="120" />
+        <el-table-column prop="content" label="内容" min-width="300" show-overflow-tooltip />
+      </el-table>
+
+      <template #footer>
+        <el-button @click="chatHistoryVisible = false">取消</el-button>
+        <el-button type="primary" @click="confirmChatHistory">确定</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { ref, nextTick, onMounted } from 'vue'
+import { ref, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { ElMessage } from 'element-plus'
 import axios from 'axios'
+import { Microphone } from '@element-plus/icons-vue'
 
 const meta = ref({
-  source: 'wechat',
+  source: 'document',
   sender: '',
 })
 
@@ -90,6 +141,19 @@ const inputText = ref('')
 const pendingFiles = ref([])
 const sending = ref(false)
 const sessionId = ref(localStorage.getItem('chat_session_id') || '')
+
+const speechSupported = ref(false)
+const isRecording = ref(false)
+const recognitionRef = ref(null)
+const voiceBaseText = ref('')
+
+const chatHistoryVisible = ref(false)
+const chatTimeRange = ref([])
+const chatFilterName = ref('')
+const wechatMessages = ref([])
+const chatHistoryLoading = ref(false)
+const chatGroups = ref([])
+const selectedChatMessages = ref([])
 
 const scrollToBottom = async () => {
   await nextTick()
@@ -114,9 +178,77 @@ const appendSystemMessage = async (content, structuredData = null) => {
 
 onMounted(async () => {
   await appendSystemMessage('你好，我是文档数据提取助手。输入“帮助”查看可用指令。')
+
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
+  if (!SpeechRecognition) {
+    speechSupported.value = false
+    return
+  }
+
+  const rec = new SpeechRecognition()
+  rec.lang = 'zh-CN'
+  rec.continuous = false
+  rec.interimResults = true
+
+  rec.onresult = (event) => {
+    let transcript = ''
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      transcript += event.results[i][0]?.transcript || ''
+    }
+    inputText.value = `${voiceBaseText.value}${transcript}`.trimStart()
+  }
+
+  rec.onerror = (event) => {
+    isRecording.value = false
+    ElMessage.error(`语音识别失败：${event?.error || 'unknown'}`)
+  }
+
+  rec.onend = () => {
+    isRecording.value = false
+  }
+
+  recognitionRef.value = rec
+  speechSupported.value = true
 })
 
+onBeforeUnmount(() => {
+  try {
+    recognitionRef.value?.stop?.()
+  } catch {
+  }
+})
+
+const toggleVoice = () => {
+  if (!speechSupported.value || !recognitionRef.value) {
+    ElMessage.warning('当前浏览器不支持语音输入')
+    return
+  }
+
+  if (isRecording.value) {
+    try {
+      recognitionRef.value.stop()
+    } catch {
+    }
+    return
+  }
+
+  voiceBaseText.value = inputText.value ? `${inputText.value.trimEnd()} ` : ''
+  try {
+    isRecording.value = true
+    recognitionRef.value.start()
+  } catch {
+    isRecording.value = false
+    ElMessage.error('语音识别启动失败')
+  }
+}
+
 const send = async () => {
+  if (isRecording.value && recognitionRef.value) {
+    try {
+      recognitionRef.value.stop()
+    } catch {
+    }
+  }
   const content = inputText.value.trim()
   const hasFiles = pendingFiles.value.length > 0
   if (!content && !hasFiles) return
@@ -179,6 +311,61 @@ const send = async () => {
   } finally {
     sending.value = false
   }
+}
+
+const showChatHistoryDialog = async () => {
+  chatHistoryVisible.value = true
+  if (chatGroups.value.length === 0) {
+    try {
+      const res = await axios.get('/wechat/chat-groups')
+      if (res.data.success) {
+        chatGroups.value = res.data.groups
+      }
+    } catch {
+    }
+  }
+}
+
+const fetchWeChatMessages = async () => {
+  chatHistoryLoading.value = true
+  try {
+    const params = {
+      page: 1,
+      per_page: 200,
+    }
+    if (chatTimeRange.value && chatTimeRange.value[0]) params.start_time = chatTimeRange.value[0]
+    if (chatTimeRange.value && chatTimeRange.value[1]) params.end_time = chatTimeRange.value[1]
+    if (chatFilterName.value) params.chat_name = chatFilterName.value
+
+    const res = await axios.get('/wechat/messages', { params })
+    if (res.data.success) {
+      wechatMessages.value = res.data.messages.reverse()
+    }
+  } catch {
+    ElMessage.error('获取聊天历史失败')
+  } finally {
+    chatHistoryLoading.value = false
+  }
+}
+
+const handleChatSelectionChange = (selection) => {
+  selectedChatMessages.value = selection
+}
+
+const confirmChatHistory = () => {
+  if (selectedChatMessages.value.length === 0) {
+    ElMessage.warning('请先选择聊天消息')
+    return
+  }
+
+  const combinedContent = selectedChatMessages.value
+    .map(m => `[${m.timestamp}] ${m.sender_name}@${m.chat_name}: ${m.content}`)
+    .join('\n')
+
+  chatHistoryVisible.value = false
+  inputText.value = `从微信聊天历史提取数据：\n${combinedContent}`
+
+  ElMessage.success(`已选择 ${selectedChatMessages.value.length} 条消息`)
 }
 
 const formatTime = (ts) => {
@@ -308,5 +495,6 @@ const formatJson = (obj) => {
 .chat-actions {
   display: flex;
   justify-content: flex-end;
+  gap: 10px;
 }
 </style>

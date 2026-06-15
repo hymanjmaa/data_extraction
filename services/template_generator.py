@@ -4,6 +4,7 @@
 """
 
 import json
+import re
 from services.extraction_engine import AIExtractionEngine
 
 class TemplateGenerator:
@@ -85,7 +86,7 @@ class TemplateGenerator:
                 'fields': data.get('fields', []),
                 'validation_rules': data.get('validation_rules', [])
             }
-            if not template.get('fields'):
+            if not template.get('fields') or self._is_generic_keyinfo_only(template.get('fields') or []):
                 return self._generate_default_template(description, document_type)
             return template
         
@@ -94,7 +95,16 @@ class TemplateGenerator:
     
     def _generate_default_template(self, description: str, document_type: str) -> dict:
         """生成默认模板"""
-        
+        fields, rules = self._heuristic_template_from_description(description)
+        if fields:
+            return {
+                'name': f'自定义模板_{document_type}',
+                'description': description,
+                'document_type': document_type,
+                'fields': fields,
+                'validation_rules': rules
+            }
+
         return {
             'name': f'自定义模板_{document_type}',
             'description': description,
@@ -109,6 +119,142 @@ class TemplateGenerator:
             ],
             'validation_rules': []
         }
+
+    def _is_generic_keyinfo_only(self, fields: list[dict]) -> bool:
+        if not fields:
+            return True
+        normalized = []
+        for f in fields:
+            name = (f or {}).get('name')
+            if isinstance(name, str):
+                normalized.append(name.strip().lower())
+        normalized = [n for n in normalized if n]
+        if not normalized:
+            return True
+        generic = {'key_info', 'keyinfo', 'keyinformation', 'key_information', '关键信息'}
+        return all(n in generic for n in normalized)
+
+    def _heuristic_template_from_description(self, description: str) -> tuple[list[dict], list[dict]]:
+        text = (description or '').strip()
+        if not text:
+            return [], []
+
+        cn_to_field = {
+            '不含税金额': ('amount_excl_tax', 'number'),
+            '税额': ('tax_amount', 'number'),
+            '含税金额': ('amount_incl_tax', 'number'),
+            '价税合计': ('amount_incl_tax', 'number'),
+            '发票号码': ('invoice_no', 'string'),
+            '发票号': ('invoice_no', 'string'),
+            '发票代码': ('invoice_code', 'string'),
+            '开票日期': ('invoice_date', 'date'),
+            '日期': ('date', 'date'),
+            '购买方名称': ('buyer_name', 'string'),
+            '购买方': ('buyer_name', 'string'),
+            '销售方名称': ('seller_name', 'string'),
+            '销售方': ('seller_name', 'string'),
+            '税率': ('tax_rate', 'number'),
+        }
+
+        def infer_type(term: str) -> str:
+            if any(k in term for k in ['金额', '税', '数量', '单价', '合计', '率']):
+                return 'number'
+            if '日期' in term or term == '日期':
+                return 'date'
+            if term.startswith('是否') or term.endswith('是否'):
+                return 'boolean'
+            return 'string'
+
+        def normalize_field(term: str, idx: int) -> tuple[str, str]:
+            term = term.strip()
+            if not term:
+                return f'field_{idx}', 'string'
+            if term in cn_to_field:
+                return cn_to_field[term]
+            return f'field_{idx}', infer_type(term)
+
+        def extract_terms(t: str) -> list[str]:
+            t = re.sub(r'\s+', ' ', t)
+            parts = re.split(r'[，,;；。\n]', t)
+            candidates: list[str] = []
+            for p in parts:
+                p = p.strip()
+                if not p:
+                    continue
+                if '用于' in p:
+                    p = p.split('用于', 1)[0].strip()
+                if '用来' in p:
+                    p = p.split('用来', 1)[0].strip()
+                if '以便' in p:
+                    p = p.split('以便', 1)[0].strip()
+                if '提取' in p:
+                    p = p.split('提取', 1)[1].strip()
+                p = re.sub(r'^(发票(上|里的|中的)?|合同(上|里的|中的)?)', '', p).strip()
+                if not p:
+                    continue
+                for s in re.split(r'[、和与及 ]', p):
+                    s = s.strip()
+                    if s:
+                        candidates.append(s)
+            seen = set()
+            out: list[str] = []
+            for c in candidates:
+                if c in seen:
+                    continue
+                seen.add(c)
+                out.append(c)
+            return out
+
+        rules: list[dict] = []
+        fields_terms = extract_terms(text)
+
+        m = re.search(r'(校验规则|校验|验证规则)\s*[:：]\s*(.+)', text)
+        rule_text = m.group(2).strip() if m else ''
+        eq = None
+        if rule_text:
+            eq = re.search(r'(.+?)\s*=\s*(.+?)\s*([\+\-\*/])\s*(.+)', rule_text)
+        if eq:
+            left_cn = eq.group(1).strip()
+            right1_cn = eq.group(2).strip()
+            op = eq.group(3).strip()
+            right2_cn = eq.group(4).strip()
+            fields_terms.extend([left_cn, right1_cn, right2_cn])
+            f_left, _ = normalize_field(left_cn, 1)
+            f_r1, _ = normalize_field(right1_cn, 2)
+            f_r2, _ = normalize_field(right2_cn, 3)
+            rules.append({
+                'type': 'equation',
+                'field1': f_r1,
+                'field2': f_r2,
+                'operator': op,
+                'result': f_left,
+                'rule': f'{f_left} = {f_r1} {op} {f_r2}',
+                'message': f'{left_cn}应等于{right1_cn}{op}{right2_cn}'
+            })
+
+        uniq_terms = []
+        seen_terms = set()
+        for t in fields_terms:
+            if not t or t in seen_terms:
+                continue
+            seen_terms.add(t)
+            uniq_terms.append(t)
+
+        fields: list[dict] = []
+        used_names = set()
+        for i, term in enumerate(uniq_terms, start=1):
+            name, ftype = normalize_field(term, i)
+            if name in used_names:
+                continue
+            used_names.add(name)
+            fields.append({
+                'name': name,
+                'description': term,
+                'type': ftype,
+                'required': True
+            })
+
+        return fields, rules
     
     def improve_template(self, current_template: dict, feedback: str) -> dict:
         """根据反馈改进模板"""

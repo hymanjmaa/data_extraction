@@ -1,6 +1,6 @@
 # 文档数据提取系统
 
-一个基于 Vue + Flask + OpenRouter 的智能文档数据提取系统，支持多种文档类型、批量处理和即时通讯集成。
+一个基于 Vue + Flask + OpenRouter/阿里云百炼 的智能文档数据提取系统，支持多种文档类型、批量处理和租约提取。
 
 ## 功能特性
 
@@ -8,7 +8,7 @@
 - **财务类**: 发票、付款水单、银行回单
 - **法务类**: 法律合同、补充协议、合规文件
 - **运营类**: 楼宇设施报告、维保记录
-- **租约类**: 租赁合同、扫描件
+- **租约类**: 租赁合同、扫描件（支持OCR）
 
 ### 2. 自定义提取模板
 - 自然语言定义提取规则
@@ -19,19 +19,27 @@
 - 多文件并行处理
 - 自动模板匹配
 - 处理状态跟踪
-- 结果导出（JSON/CSV）
+- 结果导出（JSON/CSV/XLSX）
+- ZIP文件自动解压处理
 
-### 4. 即时通讯集成
-- 微信群/IM消息解析
-- 碎片信息提炼
-- CRM数据导出
+### 4. 租约专项提取
+- 支持上传规则Excel + 合同PDF
+- 按指定模板字段自动抽取
+- 生成标准格式Excel输出
+- 支持扫描件OCR识别
+
+### 5. 语音输入支持
+- 前端ChatBot支持语音输入
+- 自动转换为文字并填入输入框
 
 ## 技术栈
 
-- **前端**: Vue 3 + Element Plus
-- **后端**: Flask + SQLAlchemy
-- **AI引擎**: OpenRouter API
+- **前端**: Vue 3 + Element Plus + Vite
+- **后端**: Flask + SQLAlchemy + Jinja2
+- **AI引擎**: OpenRouter API / 阿里云百炼 DashScope
 - **数据库**: SQLite
+- **文档解析**: pdfplumber, pytesseract, PIL, openpyxl
+- **OCR支持**: 百炼VL模型（qwen-vl-plus等）
 
 ## 快速开始
 
@@ -48,10 +56,32 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-编辑 `.env` 文件，填入你的 OpenRouter API Key：
+编辑 `.env` 文件，根据需要选择以下配置之一：
 
+#### 方案A：使用OpenRouter
 ```
-OPENROUTER_API_KEY=your-actual-api-key-here
+LLM_PROVIDER=openrouter
+OPENROUTER_API_KEY=your-openrouter-api-key
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+OPENROUTER_MODEL=your-preferred-model
+```
+
+#### 方案B：使用阿里云百炼
+```
+LLM_PROVIDER=bailian
+BAILIAN_API_KEY=your-bailian-api-key
+BAILIAN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+BAILIAN_MODEL=qwen3.6-plus
+```
+
+#### OCR配置（用于扫描件）
+```
+PDF_OCR_ENABLED=1
+BAILIAN_OCR_MODEL=qwen-vl-plus
+PDF_OCR_TEXT_THRESHOLD=200
+PDF_OCR_MAX_PAGES=5
+PDF_OCR_RESOLUTION=180
+LLM_HTTP_TIMEOUT=180
 ```
 
 ### 3. 启动后端服务
@@ -83,22 +113,30 @@ data_extraction/
 ├── app.py                 # Flask应用入口
 ├── config.py             # 配置文件
 ├── models.py             # 数据库模型
-├── routes/               # API路由
+├── requirements.txt      # Python依赖
+├── .env                  # 环境变量配置
+├── .env.example          # 环境变量示例
+├── .gitignore           # Git忽略文件
+├── Dockerfile           # Docker配置
+├── README.md            # 项目说明
+├── routes/              # API路由
 │   ├── document_routes.py
 │   ├── template_routes.py
 │   ├── batch_routes.py
 │   └── chat_routes.py
-├── services/             # 业务逻辑
+├── services/            # 业务逻辑
 │   ├── extraction_engine.py
-│   └── template_generator.py
-├── utils/                 # 工具模块
+│   ├── template_generator.py
+│   ├── lease_pdf_extractor.py
+│   └── lease_xlsx_extractor.py
+├── utils/               # 工具模块
 │   └── document_parser.py
-├── uploads/              # 文件上传目录
-└── frontend/             # Vue前端应用
+├── uploads/             # 文件上传目录
+└── frontend/            # Vue前端应用
     ├── src/
-    │   ├── views/        # 页面组件
-    │   ├── router/       # 路由配置
-    │   └── main.js       # 应用入口
+    │   ├── views/       # 页面组件
+    │   ├── router/      # 路由配置
+    │   └── main.js      # 应用入口
     └── package.json
 ```
 
@@ -118,11 +156,11 @@ data_extraction/
 - `POST /api/batch/upload` - 上传批量文件
 - `POST /api/batch/<id>/process` - 开始处理
 - `GET /api/batch/<id>/results` - 获取处理结果
+- `GET /api/batch/<id>/export?format=json|csv|xlsx` - 导出结果
 
-### 即时通讯
-- `POST /api/chat/process` - 处理单条消息
-- `GET /api/chat/list` - 获取消息列表
-- `POST /api/chat/export` - 导出CRM数据
+### 租约提取
+- 上传规则Excel + 合同PDF触发自动提取
+- 生成标准格式Excel并提供下载链接
 
 ## 使用说明
 
@@ -151,12 +189,13 @@ data_extraction/
 4. 开始处理
 5. 导出结果
 
-### 处理即时通讯消息
+### 租约专项提取
 
-1. 进入"即时通讯"页面
-2. 输入微信群/邮件内容
-3. AI自动提取结构化信息
-4. 发送到CRM系统
+1. 在聊天页面上传"租约字段提取规则.xlsx"
+2. 同时上传一个或多个合同PDF
+3. 发送任意文字（如"开始"）
+4. 系统自动按规则提取并生成Excel
+5. 通过download_url下载结果
 
 ## 配置说明
 
@@ -167,6 +206,14 @@ data_extraction/
 1. 访问 https://openrouter.ai/ 注册账号
 2. 获取API Key
 3. 在 `.env` 文件中配置
+
+### 阿里云百炼配置
+
+系统支持阿里云百炼，你需要：
+
+1. 访问 https://www.aliyun.com/product/dashscope 注册账号
+2. 获取API Key
+3. 在 `.env` 文件中配置百炼相关参数
 
 ### 支持的文档格式
 
@@ -192,30 +239,68 @@ data_extraction/
 
 在 `services/extraction_engine.py` 中修改 `_build_extraction_prompt` 方法来优化提取提示词。
 
+### 租约提取逻辑
+
+在 `services/lease_pdf_extractor.py` 中实现租约专项提取逻辑。
+
 ## 故障排除
 
 ### 问题：API调用失败
 
-- 检查 OpenRouter API Key 是否正确配置
+- 检查 OpenRouter/Bailian API Key 是否正确配置
 - 确认网络连接正常
-- 查看后端日志中的错误信息
+- 检查模型名称是否正确
 
-### 问题：文件上传失败
+### 问题：扫描件提取失败
 
-- 检查文件大小是否超过限制（默认16MB）
-- 确认文件格式是否支持
-- 检查上传目录权限
+- 确认已启用OCR功能
+- 检查OCR模型配置
+- 调整PDF_OCR_TEXT_THRESHOLD参数
 
-### 问题：提取结果不准确
+### 问题：500错误
 
-- 优化模板字段描述
-- 调整验证规则
-- 使用更具体的文档样本
+- 检查文件名是否包含特殊字符
+- 确认上传文件格式支持
+- 查看后端日志获取详细错误信息
 
-## 许可证
+## 部署
 
-MIT License
+### Docker部署
 
-## 联系方式
+```bash
+docker build -t data-extraction .
+docker run --rm -p 5000:5000 data-extraction
+```
 
-如有问题，请提交Issue。
+### 环境变量
+
+确保在部署环境中正确配置所有必要的环境变量。
+
+## 架构图
+
+```
+┌─────────────────┐    HTTP    ┌──────────────────┐
+│   Frontend      │◄──────────►│   Backend        │
+│   (Vue 3)       │            │   (Flask)        │
+└─────────────────┘            └──────────────────┘
+                                        │
+                                        ▼
+                            ┌─────────────────────────┐
+                            │   AI Services           │
+                            │   (OpenRouter/Bailian)  │
+                            └─────────────────────────┘
+                                        │
+                                        ▼
+                            ┌─────────────────────────┐
+                            │   Document Processing   │
+                            │   (pdfplumber, PIL, etc)│
+                            └─────────────────────────┘
+                                        │
+                                        ▼
+                            ┌─────────────────────────┐
+                            │   Database & Storage    │
+                            │   (SQLite, uploads/)    │
+                            └─────────────────────────┘
+```
+
+前端负责用户界面和交互，后端处理业务逻辑和API请求，AI服务提供文档解析和数据提取能力，文档处理模块负责各种格式文档的解析，数据库和存储模块负责数据持久化。

@@ -11,23 +11,23 @@ from datetime import datetime
 app = Flask(__name__)
 CORS(app)
 
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///data_extraction.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+from config import config
+env = os.getenv('FLASK_ENV', 'development')
+app.config.from_object(config.get(env, config['default']))
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 from models import db, init_db
 db.init_app(app)
 
-from routes import document_routes, template_routes, batch_routes, chat_routes
+from routes import document_routes, template_routes, batch_routes, chat_routes, wechat_routes
 from models import Document, Template, ExtractionRecord
 
 app.register_blueprint(document_routes.bp)
 app.register_blueprint(template_routes.bp)
 app.register_blueprint(batch_routes.bp)
 app.register_blueprint(chat_routes.bp)
+app.register_blueprint(wechat_routes.bp)
 
 @app.route('/api/health', methods=['GET'])
 def health_check():

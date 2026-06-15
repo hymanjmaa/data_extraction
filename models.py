@@ -90,6 +90,36 @@ class ChatSession(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+class WeChatSession(db.Model):
+    """微信登录会话模型"""
+    __tablename__ = 'wechat_sessions'
+
+    id = db.Column(db.Integer, primary_key=True)
+    uuid = db.Column(db.String(128), unique=True)
+    status = db.Column(db.String(20), default='waiting')  # waiting, scanned, logged_in, expired
+    qr_code = db.Column(db.Text)  # QR code image data (base64)
+    nickname = db.Column(db.String(100))
+    username = db.Column(db.String(100))
+    logged_in_at = db.Column(db.DateTime)
+    logged_out_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class WeChatMessage(db.Model):
+    """微信聊天消息模型"""
+    __tablename__ = 'wechat_messages'
+
+    id = db.Column(db.Integer, primary_key=True)
+    msg_id = db.Column(db.String(64), unique=True, nullable=False)
+    msg_type = db.Column(db.String(20), nullable=False)  # Text, Image, Voice, Video, etc.
+    content = db.Column(db.Text, nullable=False)
+    sender_name = db.Column(db.String(100))  # 发送者昵称
+    sender_username = db.Column(db.String(100))  # 发送者微信ID
+    chat_name = db.Column(db.String(100))  # 群聊名称或个人聊天对象昵称
+    chat_username = db.Column(db.String(100))  # 群聊ID或个人微信ID
+    is_group = db.Column(db.Boolean, default=False)  # 是否为群聊
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
 def init_db():
     """初始化数据库"""
     db.create_all()

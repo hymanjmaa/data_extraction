@@ -67,3 +67,5 @@ uploads/
 temp/
 .env
 instance/data_extraction.db
+.dbg/
+debug-lease*

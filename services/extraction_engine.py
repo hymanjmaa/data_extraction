@@ -8,15 +8,82 @@ import json
 import requests
 from typing import Dict, Any, List, Optional
 from datetime import datetime
+import time
+
+def _parse_json_from_content(content_str: str) -> dict | None:
+    if not content_str:
+        return None
+
+    s = content_str.strip()
+
+    if '```' in s:
+        parts = s.split('```')
+        if len(parts) >= 3:
+            candidate = parts[1]
+            candidate = candidate.replace('json', '', 1).strip() if candidate.lstrip().lower().startswith('json') else candidate.strip()
+            s = candidate.strip()
+
+    brace_pos = s.find('{')
+    bracket_pos = s.find('[')
+    if brace_pos == -1 and bracket_pos == -1:
+        return None
+
+    start = None
+    end_char = None
+    if brace_pos != -1 and (bracket_pos == -1 or brace_pos < bracket_pos):
+        start = brace_pos
+        end_char = '}'
+    else:
+        start = bracket_pos
+        end_char = ']'
+
+    end = s.rfind(end_char)
+    candidate = s[start:] if end == -1 else s[start:end + 1]
+
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        fixed = candidate
+        fixed = fixed.replace('\r\n', '\n')
+        import re
+        fixed = re.sub(r'":\s*:\s*', '": ', fixed)
+
+        if end_char == '}':
+            missing = fixed.count('{') - fixed.count('}')
+            if missing > 0:
+                fixed = fixed + ('}' * missing)
+        if end_char == ']':
+            missing = fixed.count('[') - fixed.count(']')
+            if missing > 0:
+                fixed = fixed + (']' * missing)
+
+        try:
+            return json.loads(fixed)
+        except Exception:
+            return None
 
 class AIExtractionEngine:
     """AI文档提取引擎"""
     
     def __init__(self):
-        self.api_key = os.getenv('OPENROUTER_API_KEY', '')
-        self.base_url = os.getenv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1')
-        self.model = os.getenv('OPENROUTER_MODEL', 'openai/gpt-3.5-turbo')
+        self.provider = (os.getenv('LLM_PROVIDER', 'openrouter') or 'openrouter').strip().lower()
+        if self.provider in ['bailian', 'dashscope', 'aliyun', 'qwen']:
+            self.provider = 'bailian'
+        else:
+            self.provider = 'openrouter'
+
+        if self.provider == 'bailian':
+            self.api_key = os.getenv('BAILIAN_API_KEY', '')
+            self.base_url = os.getenv('BAILIAN_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
+            self.model = os.getenv('BAILIAN_MODEL', 'qwen-plus')
+        else:
+            self.api_key = os.getenv('OPENROUTER_API_KEY', '')
+            self.base_url = os.getenv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1')
+            self.model = os.getenv('OPENROUTER_MODEL', 'openai/gpt-3.5-turbo')
         self.max_retries = 3
+        self.http_timeout = int(os.getenv('LLM_HTTP_TIMEOUT', '90' if self.provider == 'bailian' else '60'))
+        default_tokens = '2000' if self.provider == 'bailian' else '4000'
+        self.max_tokens = int(os.getenv('LLM_MAX_TOKENS', default_tokens))
     
     def extract(self, document_text: str, template: Dict[str, Any], context: Optional[Dict] = None) -> Dict[str, Any]:
         """从文档中提取数据"""
@@ -24,7 +91,7 @@ class AIExtractionEngine:
         if not self.api_key:
             return {
                 'success': False,
-                'error': 'OpenRouter API密钥未配置',
+                'error': 'LLM API密钥未配置',
                 'data': {}
             }
         
@@ -32,7 +99,7 @@ class AIExtractionEngine:
         
         for attempt in range(self.max_retries):
             try:
-                response = self._call_openrouter(prompt)
+                response = self._call_chat_completions(prompt)
                 
                 if response.get('success'):
                     return {
@@ -75,10 +142,23 @@ class AIExtractionEngine:
         ])
         
         validation_rules = template.get('validation_rules', [])
-        validation_description = "\n".join([
-            f"- {rule['rule']}"
-            for rule in validation_rules
-        ]) if validation_rules else "无"
+        validation_lines: List[str] = []
+        for rule in validation_rules or []:
+            if not isinstance(rule, dict):
+                continue
+            text = rule.get('rule')
+            if not text:
+                if rule.get('type') == 'equation':
+                    f1 = rule.get('field1') or ''
+                    f2 = rule.get('field2') or ''
+                    op = rule.get('operator') or ''
+                    res = rule.get('result') or ''
+                    if f1 and f2 and op and res:
+                        text = f'{res} = {f1} {op} {f2}'
+                if not text:
+                    text = rule.get('message') or json.dumps(rule, ensure_ascii=False)
+            validation_lines.append(f"- {text}")
+        validation_description = "\n".join(validation_lines) if validation_lines else "无"
         
         prompt = f"""你是一个专业的{document_type}数据提取助手。请从以下文档内容中提取指定的字段信息。
 
@@ -94,35 +174,27 @@ class AIExtractionEngine:
 ## 文档内容
 {document_text}
 
-## 输出要求
-1. 以JSON格式返回提取的数据
-2. 对于每个字段，如果找到值则返回实际值，如果未找到则返回null
-3. 确保数值字段为数字类型，日期字段为标准日期格式
-4. 如果某个字段的值不确定或缺失，明确标注
+## 输出要求（非常重要）
+1) 只输出一个可被 `json.loads` 解析的 JSON 对象，不要输出任何解释、前后缀、Markdown 代码块
+2) 只输出模板 fields 中定义的字段名作为 key；找不到就填 null
+3) 数值字段输出 number，日期字段输出 YYYY-MM-DD（无法确定则填 null）
 
-## 返回格式
-请返回以下JSON格式的数据：
+## 返回JSON格式（只允许以下字段）
 {{
-    "extracted_data": {{
-        "字段名1": "提取的值1",
-        "字段名2": "提取的值2",
-        ...
-    }},
-    "confidence": 0.0-1.0之间的置信度分数,
-    "missing_fields": ["未找到的字段列表"],
-    "notes": "备注说明（如有）"
+  "extracted_data": {{
+    "字段名1": 值或null,
+    "字段名2": 值或null
+  }},
+  "confidence": 0.0-1.0
 }}
-
-请开始提取数据："""
+"""
         
         if context:
             prompt += f"\n\n## 额外上下文信息\n{json.dumps(context, ensure_ascii=False, indent=2)}"
         
         return prompt
     
-    def _call_openrouter(self, prompt: str) -> Dict[str, Any]:
-        """调用OpenRouter API"""
-        
+    def _call_chat_completions(self, prompt: str) -> Dict[str, Any]:
         headers = {
             'Authorization': f'Bearer {self.api_key}',
             'Content-Type': 'application/json'
@@ -136,8 +208,8 @@ class AIExtractionEngine:
                     'content': prompt
                 }
             ],
-            'temperature': 0.1,
-            'max_tokens': 2000
+            'temperature': 0.0,
+            'max_tokens': self.max_tokens
         }
         
         try:
@@ -145,31 +217,24 @@ class AIExtractionEngine:
                 f'{self.base_url}/chat/completions',
                 headers=headers,
                 json=data,
-                timeout=30
+                timeout=self.http_timeout
             )
             
             response.raise_for_status()
             result = response.json()
             
             content = result['choices'][0]['message']['content']
-            
-            json_start = content.find('{')
-            json_end = content.rfind('}') + 1
-            
-            if json_start != -1 and json_end != 0:
-                json_str = content[json_start:json_end]
-                parsed = json.loads(json_str)
-                
+            content_str = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            parsed = _parse_json_from_content(content_str)
+
+            if isinstance(parsed, dict):
                 return {
                     'success': True,
                     'data': parsed.get('extracted_data', {}),
                     'confidence': parsed.get('confidence', 0.0)
                 }
-            else:
-                return {
-                    'success': False,
-                    'error': '无法解析AI响应'
-                }
+
+            return {'success': False, 'error': '无法解析AI响应'}
         
         except requests.exceptions.RequestException as e:
             return {
@@ -186,7 +251,7 @@ class AIExtractionEngine:
         if not self.api_key:
             return {
                 'success': False,
-                'error': 'OpenRouter API密钥未配置',
+                'error': 'LLM API密钥未配置',
                 'data': None
             }
 
@@ -207,44 +272,55 @@ class AIExtractionEngine:
             'max_tokens': max_tokens
         }
 
-        try:
-            response = requests.post(
-                f'{self.base_url}/chat/completions',
-                headers=headers,
-                json=data,
-                timeout=30
-            )
-            response.raise_for_status()
-            result = response.json()
-            content = result['choices'][0]['message']['content']
+        last_err = None
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.post(
+                    f'{self.base_url}/chat/completions',
+                    headers=headers,
+                    json=data,
+                    timeout=self.http_timeout
+                )
+                response.raise_for_status()
+                result = response.json()
+                content = result['choices'][0]['message']['content']
 
-            json_start = content.find('{')
-            json_end = content.rfind('}') + 1
+                json_start = content.find('{')
+                json_end = content.rfind('}') + 1
 
-            if json_start == -1 or json_end == 0:
+                if json_start == -1 or json_end == 0:
+                    return {
+                        'success': False,
+                        'error': '无法解析AI响应',
+                        'data': None
+                    }
+
+                parsed = json.loads(content[json_start:json_end])
+                return {
+                    'success': True,
+                    'data': parsed
+                }
+            except requests.exceptions.RequestException as e:
+                last_err = e
+                if attempt < self.max_retries - 1:
+                    time.sleep(1 * (2 ** attempt))
+                    continue
                 return {
                     'success': False,
-                    'error': '无法解析AI响应',
+                    'error': f'API请求失败: {str(e)}',
                     'data': None
                 }
-
-            parsed = json.loads(content[json_start:json_end])
-            return {
-                'success': True,
-                'data': parsed
-            }
-        except requests.exceptions.RequestException as e:
-            return {
-                'success': False,
-                'error': f'API请求失败: {str(e)}',
-                'data': None
-            }
-        except json.JSONDecodeError as e:
-            return {
-                'success': False,
-                'error': f'JSON解析失败: {str(e)}',
-                'data': None
-            }
+            except json.JSONDecodeError as e:
+                return {
+                    'success': False,
+                    'error': f'JSON解析失败: {str(e)}',
+                    'data': None
+                }
+        return {
+            'success': False,
+            'error': f'API请求失败: {str(last_err) if last_err else "未知错误"}',
+            'data': None
+        }
     
     def batch_extract(self, documents: List[Dict[str, Any]], template: Dict[str, Any]) -> List[Dict[str, Any]]:
         """批量提取"""

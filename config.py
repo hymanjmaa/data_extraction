@@ -13,14 +13,21 @@ class Config:
     SQLALCHEMY_DATABASE_URI = os.getenv('DATABASE_URL', 'sqlite:///data_extraction.db')
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     
+    LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'openrouter')
+
     # OpenRouter配置
     OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
     OPENROUTER_BASE_URL = os.getenv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1')
     OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'openai/gpt-3.5-turbo')
+
+    # 阿里云百炼(DashScope兼容模式)配置
+    BAILIAN_API_KEY = os.getenv('BAILIAN_API_KEY', '')
+    BAILIAN_BASE_URL = os.getenv('BAILIAN_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
+    BAILIAN_MODEL = os.getenv('BAILIAN_MODEL', 'qwen-plus')
     
     # 文件上传配置
     UPLOAD_FOLDER = 'uploads'
-    MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16MB
+    MAX_CONTENT_LENGTH = 100 * 1024 * 1024  # 100MB
     ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg', 'docx', 'xlsx', 'zip'}
     
     # 文档处理配置

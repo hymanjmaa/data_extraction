@@ -4,6 +4,7 @@ import DocumentUpload from '../views/DocumentUpload.vue'
 import TemplateManager from '../views/TemplateManager.vue'
 import BatchProcess from '../views/BatchProcess.vue'
 import ChatIntegration from '../views/ChatIntegration.vue'
+import WeChatManager from '../views/WeChatManager.vue'
 
 const routes = [
   {
@@ -30,6 +31,11 @@ const routes = [
     path: '/chat',
     name: 'ChatIntegration',
     component: ChatIntegration
+  },
+  {
+    path: '/wechat',
+    name: 'WeChatManager',
+    component: WeChatManager
   }
 ]
 

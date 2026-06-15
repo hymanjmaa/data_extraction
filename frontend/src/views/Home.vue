@@ -9,7 +9,8 @@
             <el-menu-item index="/documents">文档上传</el-menu-item>
             <el-menu-item index="/templates">模板管理</el-menu-item>
             <el-menu-item index="/batch">批量处理</el-menu-item>
-            <el-menu-item index="/chat">即时通讯</el-menu-item>
+            <el-menu-item index="/chat">文档数据提取助手</el-menu-item>
+            <el-menu-item index="/wechat">微信管理</el-menu-item>
           </el-menu>
         </div>
       </el-header>
